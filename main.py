@@ -1,14 +1,16 @@
 import sys
 import cv2
 import numpy as np
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QLabel, QVBoxLayout, QHBoxLayout,
     QPushButton, QWidget, QCheckBox, QGroupBox, QFileDialog, QSlider, QListWidget, QListWidgetItem,
-    QSizePolicy
+    QSizePolicy, QSpinBox
 )
+
 from PyQt5.QtCore import Qt, QSize, QTimer
 from PyQt5.QtGui import QPixmap, QImage
-
+from scipy.spatial import Delaunay  # **三角剖分**
 
 class PolygonSimplifierApp(QMainWindow):
     def __init__(self, image_path):
@@ -34,57 +36,76 @@ class PolygonSimplifierApp(QMainWindow):
 
     def init_ui(self):
         self.setWindowTitle("Polygon Detection and Filling")
-        self.setGeometry(100, 100, 1400, 800)  # 調整視窗大小
+        self.setGeometry(100, 100, 1400, 800)
         self.setMinimumSize(1400, 800)
 
-        # 圖像顯示區域
+        # **左側圖片顯示區**
         self.image_label = QLabel(self)
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setScaledContents(True)
 
-        # 列表欄位：顯示輪廓及內洞關係
-        self.contour_list = QListWidget(self)  # 指定父層為主視窗
-        self.contour_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)  # 開啟水平滾動條
-        # self.contour_list.currentRowChanged.connect(self.update_processing)  # 連接選中行信號
+        # **右側下半部：輪廓列表**
+        self.contour_list = QListWidget(self)
+        self.contour_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.contour_list.currentRowChanged.connect(self.on_row_changed)
 
-        # 參數調整區域
+        # **右側上半部：參數調整區**
         sliders_layout = QVBoxLayout()
         sliders_layout.addWidget(self.create_slider("Threshold", 0, 255, self.threshold_value, self.update_processing))
 
-        # Checkbox：是否顯示頂點
+        # **Checkbox：是否顯示頂點**
         self.vertex_checkbox = QCheckBox("Show Vertices")
         self.vertex_checkbox.setChecked(self.show_vertices)
         self.vertex_checkbox.stateChanged.connect(self.update_processing)
         sliders_layout.addWidget(self.vertex_checkbox)
 
-        # GroupBox：參數區域
-        sliders_group = QGroupBox("Parameters")
-        sliders_group.setLayout(sliders_layout)
+        # **Extrude 設定區域**
+        extrude_layout = QHBoxLayout()
 
-        # 按鈕區域
+        # **Z 高度輸入框**
+        self.extrude_height_input = QSpinBox()
+        self.extrude_height_input.setRange(100, 1000)  # 設定範圍
+        self.extrude_height_input.setValue(100)  # 預設值
+
+        # **Extrude 按鈕**
+        self.extrude_button = QPushButton("Extrude", self)
+        self.extrude_button.clicked.connect(self.extrude_contour)
+
+        # **將高度輸入框與按鈕放在同一行**
+        extrude_layout.addWidget(self.extrude_height_input)
+        extrude_layout.addWidget(self.extrude_button)
+
+        # **封閉選項**
+        self.fill_base_checkbox = QCheckBox("Fill Base (封底)")
+        self.fill_base_checkbox.setChecked(True)  # 預設勾選
+
+        self.fill_top_checkbox = QCheckBox("Fill Top (封頂)")
+        self.fill_top_checkbox.setChecked(True)  # 預設勾選
+
+        # **加入參數區**
+        sliders_layout.addLayout(extrude_layout)
+        sliders_layout.addWidget(self.fill_base_checkbox)
+        sliders_layout.addWidget(self.fill_top_checkbox)
+
+        # **按鈕區域**
         buttons_layout = QVBoxLayout()
-        load_button = QPushButton("Load Image", self)
-        load_button.clicked.connect(self.load_new_image)
-        save_button = QPushButton("Save", self)
-        save_button.clicked.connect(self.save_results)
-        quit_button = QPushButton("Quit", self)
-        quit_button.clicked.connect(self.close)
-        buttons_layout.addWidget(load_button)
-        buttons_layout.addWidget(save_button)
-        buttons_layout.addWidget(quit_button)
+        buttons_layout.addWidget(QPushButton("Load Image", self, clicked=self.load_new_image))
+        buttons_layout.addWidget(QPushButton("Save", self, clicked=self.save_results))
+        buttons_layout.addWidget(QPushButton("Quit", self, clicked=self.close))
 
         sliders_layout.addLayout(buttons_layout)
 
-        # 右側垂直堆疊：參數區域 + 列表
+        # **右側區域（參數調整 + 輪廓列表）**
         right_layout = QVBoxLayout()
-        right_layout.addWidget(sliders_group, stretch=1)
-        right_layout.addWidget(self.contour_list, stretch=2)  # 列表佔較大空間
+        sliders_group = QGroupBox("Parameters")
+        sliders_group.setLayout(sliders_layout)
+        right_layout.addWidget(sliders_group, stretch=1)  # 上半部參數調整區
+        right_layout.addWidget(self.contour_list, stretch=2)  # 下半部列表區
 
-        # 主佈局：左側圖片 + 右側垂直堆疊區域
+        # **主佈局（左側圖片 + 右側控件）**
         main_layout = QHBoxLayout()
-        main_layout.addWidget(self.image_label, stretch=3)  # 圖片佔 3/5 的空間
-        main_layout.addLayout(right_layout, stretch=2)  # 控制區域佔 2/5 的空間
+        main_layout.addWidget(self.image_label, stretch=3)  # 左側圖片區
+        main_layout.addLayout(right_layout, stretch=2)  # 右側控制區
 
         container = QWidget()
         container.setLayout(main_layout)
@@ -109,6 +130,101 @@ class PolygonSimplifierApp(QMainWindow):
         setattr(self, f"{slider_name.lower().replace(' ', '_')}_value", value)
         callback()
 
+    def save_stl(self, faces, filename):
+        """將三角形面片寫入 STL 檔案"""
+        with open(filename, "w") as f:
+            f.write("solid extruded_mesh\n")
+
+            for tri in faces:
+                f.write("  facet normal 0.0 0.0 0.0\n")
+                f.write("    outer loop\n")
+                for vertex in tri:
+                    f.write(f"      vertex {vertex[0]} {vertex[1]} {vertex[2]}\n")
+                f.write("    endloop\n")
+                f.write("  endfacet\n")
+
+            f.write("endsolid extruded_mesh\n")
+
+    def create_cube(self, x, y, size, height):
+        """建立一個立方體（修正三角形方向）"""
+        p0 = (x, y, 0)
+        p1 = (x + size, y, 0)
+        p2 = (x + size, y + size, 0)
+        p3 = (x, y + size, 0)
+        
+        p4 = (x, y, height)
+        p5 = (x + size, y, height)
+        p6 = (x + size, y + size, height)
+        p7 = (x, y + size, height)
+
+        # **修正所有面為逆時針順序 (CCW)**
+        faces = [
+            [p0, p2, p1], [p0, p3, p2],  # **底部 (XY 平面)**
+            [p4, p5, p6], [p4, p6, p7],  # **頂部 (XY 平面)**
+            [p0, p1, p5], [p0, p5, p4],  # **前面**
+            [p1, p2, p6], [p1, p6, p5],  # **右側**
+            [p2, p3, p7], [p2, p7, p6],  # **後面**
+            [p3, p0, p4], [p3, p4, p7]   # **左側**
+        ]
+        return faces
+    
+    def extrude_single_contour(self, contour_id, contours, hierarchy, z_height, grid_size):
+        """拉伸單個輪廓（包含內孔洞），回傳 STL 面片"""
+        outer_contour = contours[contour_id]  # **外輪廓**
+        hole_contours = [contours[i] for i, h in enumerate(hierarchy) if h[3] == contour_id]  # **內孔洞**
+
+        print(f"[DEBUG] Extruding Contour ID: {contour_id}, Found {len(hole_contours)} holes")
+
+        # **計算棋盤範圍**
+        x_min, y_min = np.min(outer_contour[:, 0, :], axis=0)
+        x_max, y_max = np.max(outer_contour[:, 0, :], axis=0)
+
+        print(f"[DEBUG] Grid Boundary: X=({x_min}, {x_max}), Y=({y_min}, {y_max})")
+
+        faces = []  # **儲存 STL 面片**
+
+        # **遍歷棋盤格，判斷哪些方格在輪廓內**
+        for x in range(x_min, x_max, grid_size):
+            for y in range(y_min, y_max, grid_size):
+                cell_center = (x + grid_size / 2, y + grid_size / 2)
+
+                # **檢查是否在外輪廓內**
+                inside_outer = cv2.pointPolygonTest(outer_contour, cell_center, measureDist=False) >= 0
+                inside_hole = any(cv2.pointPolygonTest(h, cell_center, measureDist=False) >= 0 for h in hole_contours)
+
+                if inside_outer and not inside_hole:
+                    cube_faces = self.create_cube(x, y, grid_size, z_height)
+                    faces.extend(cube_faces)
+
+        return faces
+
+    def extrude_contour(self):
+        """拉伸所有勾選的輪廓，生成 STL"""
+        z_height = self.extrude_height_input.value()
+        grid_size = 10  # 棋盤格大小
+
+        print(f"[DEBUG] Extruding all checked contours, Height: {z_height}, Grid Size: {grid_size}")
+
+        # **確保 contours 存在**
+        if not self.contours:
+            print("[DEBUG] No contours available, skipping extrusion.")
+            return
+
+        faces = []
+
+        # **遍歷所有勾選的輪廓**
+        for contour_id in self.checkbox_states:
+            if self.checkbox_states[contour_id]:  # **只處理勾選的輪廓**
+                if contour_id >= len(self.contours):  # **檢查是否超出範圍**
+                    print(f"[DEBUG] Skipping invalid contour ID: {contour_id}")
+                    continue
+
+                faces.extend(self.extrude_single_contour(contour_id, self.contours, self.hierarchy, z_height, grid_size))
+
+        # **儲存 STL**
+        self.save_stl(faces, "extruded_voxel_mesh_all.stl")
+        print("[DEBUG] STL file saved: extruded_voxel_mesh_all.stl")
+            
     def on_checkbox_state_changed(self, contour_id, state):
         """
         處理 Checkbox 狀態變化。
@@ -262,14 +378,23 @@ class PolygonSimplifierApp(QMainWindow):
 
         for outer, holes in contour_dict.items():
             text = f"Contour = {outer}, Holes = [{', '.join(map(str, holes))}]" if holes else f"Contour = {outer}"
-            
-            print(f"[DEBUG] Creating item for: '{text}'")
-
-            # **使用 `add_checkbox_item()` 來確保 `QCheckBox` 仍然存在**
             checkbox = self.add_checkbox_item(outer, text)
-            checkbox.setChecked(self.checkbox_states.get(outer, True))
 
-        print(f"[DEBUG] Contour list count after update: {self.contour_list.count()}")
+            # **確保 checkbox 狀態被正確存入**
+            self.checkbox_states[outer] = checkbox.isChecked()  # **這行讓未點擊的也會有狀態**
+
+        print("[DEBUG] Updated checkbox_states =", self.checkbox_states)
+
+        # for outer, holes in contour_dict.items():
+        #     text = f"Contour = {outer}, Holes = [{', '.join(map(str, holes))}]" if holes else f"Contour = {outer}"
+            
+        #     print(f"[DEBUG] Creating item for: '{text}'")
+
+        #     # **使用 `add_checkbox_item()` 來確保 `QCheckBox` 仍然存在**
+        #     checkbox = self.add_checkbox_item(outer, text)
+        #     checkbox.setChecked(self.checkbox_states.get(outer, True))
+
+        # print(f"[DEBUG] Contour list count after update: {self.contour_list.count()}")
 
         # **確認 `QCheckBox` 是否正常添加**
         for i in range(self.contour_list.count()):
@@ -286,50 +411,76 @@ class PolygonSimplifierApp(QMainWindow):
 
         gray = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2GRAY)
         _, binary = cv2.threshold(gray, self.threshold_value, 255, cv2.THRESH_BINARY_INV)
-        contours, hierarchy = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        self.contours, _hierarchy = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
 
-        if not contours or hierarchy is None:
+        if not self.contours or _hierarchy is None:
             print("[DEBUG] No contours found.")
             self.contour_list.clear()
             self.processed_image = self.original_image.copy()
             self.update_display()
             return
 
-        print(f"[DEBUG] Found {len(contours)} contours")
-        self.update_contour_list(contours, hierarchy)
+        print(f"[DEBUG] Found {len(self.contours)} contours")
+        self.update_contour_list(self.contours, _hierarchy)
 
         output_image = self.original_image.copy()
+        self.hierarchy = _hierarchy[0]  # 確保 `hierarchy` 正確展開
 
-        # **確保 `hierarchy` 只有一個層級**
-        hierarchy = hierarchy[0]
-
+        # **建立輪廓與內洞對應關係**
         contour_hierarchy_map = {}  # {外輪廓: [內洞列表]}
-        for i, h in enumerate(hierarchy):
+        hole_to_parent = {}  # {內洞: 外輪廓}
+
+        for i, h in enumerate(self.hierarchy):
             parent = h[3]
             if parent == -1:
                 contour_hierarchy_map[i] = []
                 child = h[2]
                 while child != -1:
                     contour_hierarchy_map[i].append(child)
-                    child = hierarchy[child][0]
+                    hole_to_parent[child] = i
+                    child = self.hierarchy[child][0]
 
         # **根據 Checkbox 狀態決定哪些輪廓要顯示**
         for outer, holes in contour_hierarchy_map.items():
             if outer in self.checkbox_states and not self.checkbox_states[outer]:
-                print(f"[DEBUG] Skipping Contour {outer}")
-                continue
+                print(f"[DEBUG] Skipping Contour {outer} (Checkbox Unchecked)")
+                continue  # 不畫出該外輪廓
 
-            cv2.polylines(output_image, [contours[outer]], isClosed=True, color=(0, 255, 0), thickness=2)
+            # 畫外輪廓
+            cv2.polylines(output_image, [self.contours[outer]], isClosed=True, color=(0, 255, 0), thickness=2)
 
+            # 畫內洞
             for hole in holes:
-                cv2.polylines(output_image, [contours[hole]], isClosed=True, color=(0, 0, 255), thickness=2)
+                if hole in self.checkbox_states and not self.checkbox_states[hole]:
+                    print(f"[DEBUG] Skipping Hole {hole} (Checkbox Unchecked)")
+                    continue  # 不畫出該內洞
+                cv2.polylines(output_image, [self.contours[hole]], isClosed=True, color=(0, 0, 255), thickness=2)
 
-        # **高亮目前選中的輪廓**
+        # **高亮顯示完整輪廓組（包括 contour 和 holes）**
         if hasattr(self, "selected_contour_id"):
             highlight_id = self.selected_contour_id
-            if 0 <= highlight_id < len(contours):
-                print(f"[DEBUG] Highlighting Contour ID: {highlight_id}")
-                cv2.polylines(output_image, [contours[highlight_id]], isClosed=True, color=(0, 255, 255), thickness=3)
+            highlight_group = set()
+
+            # **如果選中的是外輪廓，包含其所有內洞**
+            if highlight_id in contour_hierarchy_map and self.checkbox_states.get(highlight_id, True):
+                highlight_group.add(highlight_id)
+                highlight_group.update(contour_hierarchy_map[highlight_id])
+
+            # **如果選中的是內洞，回溯到外輪廓並包含整組**
+            # elif highlight_id in hole_to_parent:
+            #     parent_id = hole_to_parent[highlight_id]
+            #     highlight_group.add(parent_id)
+            #     highlight_group.update(contour_hierarchy_map[parent_id])
+
+            # **過濾掉 Checkbox 取消選取的輪廓**
+            # highlight_group = {cid for cid in highlight_group if self.checkbox_states.get(cid, True)}
+
+            if highlight_group:
+                print(f"[DEBUG] Highlighting Contour Group: {highlight_group}")
+                for cid in highlight_group:
+                    cv2.polylines(output_image, [self.contours[cid]], isClosed=True, color=(0, 255, 255), thickness=3)
+            else:
+                print("[DEBUG] No contours to highlight (All Checkboxes Unchecked)")
 
         self.processed_image = output_image
         self.update_display()

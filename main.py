@@ -2,6 +2,10 @@ import sys
 import cv2
 import numpy as np
 
+# from OpenGL.GL import glClear, GL_COLOR_BUFFER_BIT
+# from OpenGL.GLUT import glutInit
+from PyQt5.QtWidgets import QMessageBox
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QLabel, QVBoxLayout, QHBoxLayout,
     QPushButton, QWidget, QCheckBox, QGroupBox, QFileDialog, QSlider, QListWidget, QListWidgetItem,
@@ -10,7 +14,7 @@ from PyQt5.QtWidgets import (
 
 from PyQt5.QtCore import Qt, QSize, QTimer
 from PyQt5.QtGui import QPixmap, QImage
-from scipy.spatial import Delaunay  # **三角剖分**
+# from scipy.spatial import Delaunay  # **三角剖分**
 
 class PolygonSimplifierApp(QMainWindow):
     def __init__(self, image_path):
@@ -25,6 +29,8 @@ class PolygonSimplifierApp(QMainWindow):
         self.threshold_value = 200
         self.show_vertices = False  # 是否顯示頂點
         self.fill_alpha = 100  # 內部填充透明度（固定）
+        self.min_contour_area = 100
+        self.invalid_contours = set()  # **存放過小輪廓的 ID**
 
         # 儲存 Checkbox 狀態
         self.contour_checkboxes = {}
@@ -353,6 +359,24 @@ class PolygonSimplifierApp(QMainWindow):
         # 儲存 Checkbox 對應到 contour_id
         self.contour_checkboxes[contour_id] = checkbox
         return checkbox
+    
+    def calculate_contour_area(self, contour_id, contours, hierarchy):
+        """
+        計算指定輪廓 ID 的面積，考慮內洞的影響
+        :param contour_id: 外輪廓 ID
+        :param contours: 所有輪廓列表
+        :param hierarchy: 層級結構
+        :return: 計算後的有效面積（內洞會被扣除）
+        """
+        # hierarchy = hierarchy[0]  # 提取層級資訊
+        total_area = cv2.contourArea(contours[contour_id])  # 先計算外輪廓面積
+
+        # **扣除內洞面積**
+        for i, h in enumerate(hierarchy):
+            if h[3] == contour_id:  # **找到屬於這個外輪廓的內洞**
+                total_area -= cv2.contourArea(contours[i])
+
+        return total_area
 
     def update_contour_list(self, contours, hierarchy):
         """更新輪廓列表，確保 `QCheckBox` 正確顯示"""
@@ -363,6 +387,8 @@ class PolygonSimplifierApp(QMainWindow):
             self.contour_list.clear()
             return
 
+        # **清空之前的 invalid_contours**
+        self.invalid_contours.clear()
         self.contour_list.clear()  # 清空列表
         hierarchy = hierarchy[0]
 
@@ -370,11 +396,15 @@ class PolygonSimplifierApp(QMainWindow):
         for i, h in enumerate(hierarchy):
             parent = h[3]
             if parent == -1:
-                contour_dict[i] = []
-                child = h[2]
-                while child != -1:
-                    contour_dict[i].append(child)
-                    child = hierarchy[child][0]
+                area = self.calculate_contour_area(i, contours, hierarchy)
+                if area >= self.min_contour_area:  # **只加入足夠大的輪廓**
+                    contour_dict[i] = []
+                    child = h[2]
+                    while child != -1:
+                        contour_dict[i].append(child)
+                        child = hierarchy[child][0]
+                else:
+                    self.invalid_contours.add(i)
 
         for outer, holes in contour_dict.items():
             text = f"Contour = {outer}, Holes = [{', '.join(map(str, holes))}]" if holes else f"Contour = {outer}"
@@ -431,6 +461,11 @@ class PolygonSimplifierApp(QMainWindow):
         hole_to_parent = {}  # {內洞: 外輪廓}
 
         for i, h in enumerate(self.hierarchy):
+
+            if i in self.invalid_contours:
+                print(f"[DEBUG] Skipping small contour ID {i}")
+                continue  # **跳過小輪廓**
+
             parent = h[3]
             if parent == -1:
                 contour_hierarchy_map[i] = []
